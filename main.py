@@ -96,8 +96,6 @@ class Net(nn.Module):
         return out
 
 
-torch.manual_seed(0)
-
 net = Net()
 net.cuda()
 
@@ -201,6 +199,7 @@ def train(epoch):
             print(optimizer.m_aa[optimizer.modules[1]])
             print("m_gg")
             print(optimizer.m_gg[optimizer.modules[1]])
+            print(f"Lambdas: {optimizer.lambda_1}, {optimizer.lambda_p}")
         loss.backward()
         optimizer.step()
 

@@ -50,6 +50,9 @@ class KFACOptimizer(optim.Optimizer):
         self.d_a, self.d_g = {}, {}
         self.Q_a_, self.Q_g_ = {}, {}
         self.d_a_, self.d_g_ = {}, {}
+        self.lambda_1 = None
+        self.lambda_p = None
+        self.yaarrr_grads = {}
         self.stat_decay = stat_decay
 
         self.alpha = alpha
@@ -110,6 +113,103 @@ class KFACOptimizer(optim.Optimizer):
 
         #self.d_a[m].mul_((self.d_a[m] > eps).float())
         #self.d_g[m].mul_((self.d_g[m] > eps).float())
+
+    def _update_yaarrr_grads(self):
+        # YAARRR
+        sizes = {}
+        with torch.no_grad():
+            for m in self.modules:
+                classname = m.__class__.__name__
+                p_grad_mat = self._get_matrix_form_grad(m, classname)
+                size = p_grad_mat.size()
+                sizes[m] = size
+        v_1s = []
+        v_ps = []
+        prod_1s = []
+        prod_ps = []
+        sizes = {}
+        opt = self
+        with torch.no_grad():
+            for m in opt.modules:
+                classname = m.__class__.__name__
+                p_grad_mat = opt._get_matrix_form_grad(m, classname)
+                size = p_grad_mat.size()
+                sizes[m] = size
+        # Largest eigenvalue.
+        for m in opt.modules:
+            v_1 = torch.rand(sizes[m], requires_grad=True).cuda()
+            v_1 = v_1/torch.norm(v_1)
+            for x in range(self.num_iter + 1):
+                if x < self.num_iter:
+                    v_11 = opt.Q_g[m].t() @ v_1 @ opt.Q_a[m]
+                    v_12 = v_11 / (opt.d_g[m].unsqueeze(1)
+                                   * opt.d_a[m].unsqueeze(0))
+                    v_1 = opt.Q_g[m] @ v_12 @ opt.Q_a[m].t()
+                    v_1 = v_1/torch.norm(v_1)
+                else:
+                    # Save product
+                    p_11 = opt.Q_g[m].t() @ v_1 @ opt.Q_a[m]
+                    p_12 = p_11 / (opt.d_g[m].unsqueeze(1)
+                                   * opt.d_a[m].unsqueeze(0))
+                    p_1 = opt.Q_g[m] @ p_12 @ opt.Q_a[m].t()
+            v_1s.append(v_1.flatten())
+            prod_1s.append(p_1.flatten())
+        prod_1_full = torch.cat(prod_1s, axis=0)
+        v_1_full = torch.cat(v_1s, axis=0)
+        lambda_1 = v_1_full.T @ prod_1_full / (v_1_full.T @ v_1_full)
+
+        # Smallest eigenvalue.
+        for m in opt.modules:
+            # Spectral shift
+            eps = 1e-5  # for numerical stability
+            scale_a = (opt.m_aa[m].max()-opt.m_aa[m].min())*eps
+            scale_g = (opt.m_gg[m].max()-opt.m_gg[m].min())*eps
+
+            eps_matrix_a = torch.diag(torch.rand(
+                opt.m_aa[m].shape[0])).cuda() * scale_a
+            eps_matrix_g = torch.diag(torch.rand(
+                opt.m_gg[m].shape[0])).cuda() * scale_g
+            ident_aa = torch.eye(opt.m_aa[m].shape[0]).cuda()
+            ident_gg = torch.eye(opt.m_gg[m].shape[0]).cuda()
+            self.d_a_[m], self.Q_a_[m] = torch.symeig(opt.m_aa[m] - ident_aa * lambda_1 - eps_matrix_a,
+                                                      eigenvectors=True)
+            self.d_g_[m], self.Q_g_[m] = torch.symeig(opt.m_gg[m] - ident_gg * lambda_1 - eps_matrix_g,
+                                                      eigenvectors=True)
+
+            # New random vector.
+            v_p = torch.rand(sizes[m], requires_grad=True).cuda()
+            v_p = v_p/torch.norm(v_p)
+            for x in range(self.num_iter + 1):
+                # Multiply with shifted matrix.
+                if x < self.num_iter:
+                    v_p1 = self.Q_g_[m].t() @ v_p @ self.Q_a_[m]
+                    v_p2 = v_p1 / \
+                        (self.d_g_[m].unsqueeze(1) * self.d_a_[m].unsqueeze(0))
+                    v_p = self.Q_g_[m] @ v_p2 @ self.Q_a_[m].t()
+                    v_p = v_p/torch.norm(v_p)
+                else:
+                    # Need to multiply with the unshifted matrix at end.
+                    p_p1 = opt.Q_g[m].t() @ v_p @ opt.Q_a[m]
+                    p_p2 = p_p1 / (opt.d_g[m].unsqueeze(1)
+                                   * opt.d_a[m].unsqueeze(0))
+                    p_p = opt.Q_g[m] @ p_p2 @ opt.Q_a[m].t()
+            prod_ps.append(p_p.flatten())
+            v_ps.append(v_p.flatten())
+        prod_p_full = torch.cat(prod_ps, axis=0)
+        v_p_full = torch.cat(v_ps, axis=0)
+        lambda_p = (v_p_full.T @ prod_p_full) / (v_p_full.T @ v_p_full)
+
+        # Condition number
+        cond = torch.abs(lambda_1) / torch.abs(lambda_p)
+        self.lambda_1 = lambda_1
+        self.lambda_p = lambda_p
+        yaarrr = cond * self.alpha
+        yaarrr.backward()
+        # Add updates
+        for m in self.modules:
+            classname = m.__class__.__name__
+            cond_grad_mat = self._get_matrix_form_grad(m, classname)
+            self.yaarrr_grads[m] = cond_grad_mat
 
     @staticmethod
     def _get_matrix_form_grad(m, classname):
@@ -197,114 +297,20 @@ class KFACOptimizer(optim.Optimizer):
         lr = group['lr']
         damping = group['damping']
         updates = {}
-        for m in self.modules:
-            classname = m.__class__.__name__
-            if self.steps % self.TInv == 0:
-                self._update_inv(m)
-            p_grad_mat = self._get_matrix_form_grad(m, classname)
-            v = self._get_natural_grad(m, p_grad_mat, damping)
-            updates[m] = v
-
-        # YAARRR
-        sizes = {}
-        with torch.no_grad():
+        if self.steps % self.TInv == 0:
             for m in self.modules:
                 classname = m.__class__.__name__
-                p_grad_mat = self._get_matrix_form_grad(m, classname)
-                size = p_grad_mat.size()
-                sizes[m] = size
-        v_1s = []
-        v_ps = []
-        prod_1s = []
-        prod_ps = []
-        sizes = {}
-        opt = self
-        with torch.no_grad():
-            for m in opt.modules:
-                classname = m.__class__.__name__
-                p_grad_mat = opt._get_matrix_form_grad(m, classname)
-                size = p_grad_mat.size()
-                sizes[m] = size
-        # Largest eigenvalue.
-        for m in opt.modules:
-            v_1 = torch.rand(sizes[m], requires_grad=True).cuda()
-            v_1 = v_1/torch.norm(v_1)
-            for x in range(self.num_iter + 1):
-                if x < self.num_iter:
-                    v_11 = opt.Q_g[m].t() @ v_1 @ opt.Q_a[m]
-                    v_12 = v_11 / (opt.d_g[m].unsqueeze(1)
-                                   * opt.d_a[m].unsqueeze(0))
-                    v_1 = opt.Q_g[m] @ v_12 @ opt.Q_a[m].t()
-                    v_1 = v_1/torch.norm(v_1)
-                else:
-                    # Save product
-                    p_11 = opt.Q_g[m].t() @ v_1 @ opt.Q_a[m]
-                    p_12 = p_11 / (opt.d_g[m].unsqueeze(1)
-                                   * opt.d_a[m].unsqueeze(0))
-                    p_1 = opt.Q_g[m] @ p_12 @ opt.Q_a[m].t()
-            v_1s.append(v_1.flatten())
-            prod_1s.append(p_1.flatten())
-        prod_1_full = torch.cat(prod_1s, axis=0)
-        v_1_full = torch.cat(v_1s, axis=0)
-        lambda_1 = v_1_full.T @ prod_1_full / (v_1_full.T @ v_1_full)
-
-        # Smallest eigenvalue.
-        for m in opt.modules:
-            # Spectral shift
-            eps = 1e-5  # for numerical stability
-            scale_a = (opt.m_aa[m].max()-opt.m_aa[m].min())*eps
-            scale_g = (opt.m_gg[m].max()-opt.m_gg[m].min())*eps
-
-            eps_matrix_a = torch.diag(torch.rand(
-                opt.m_aa[m].shape[0])).cuda() * scale_a
-            eps_matrix_g = torch.diag(torch.rand(
-                opt.m_gg[m].shape[0])).cuda() * scale_g
-            ident_aa = torch.eye(opt.m_aa[m].shape[0]).cuda()
-            ident_gg = torch.eye(opt.m_gg[m].shape[0]).cuda()
-            self.d_a_[m], self.Q_a_[m] = torch.symeig(opt.m_aa[m] - ident_aa * lambda_1 - eps_matrix_a,
-                                            eigenvectors=True)
-            self.d_g_[m], self.Q_g_[m] = torch.symeig(opt.m_gg[m] - ident_gg * lambda_1 - eps_matrix_g,
-                                            eigenvectors=True)
-            #self.d_a_[m] = (1. / opt.d_a[m]) - ident_aa * lambda_1
-            #self.d_g_[m] = (1. /opt.d_g[m]) - ident_gg * lambda_1
-
-            # New random vector.
-            v_p = torch.rand(sizes[m], requires_grad=True).cuda()
-            v_p = v_p/torch.norm(v_p)
-            for x in range(self.num_iter + 1):
-                # Multiply with shifted matrix.
-                if x < self.num_iter:
-                    v_p1 = self.Q_g_[m].t() @ v_p @ self.Q_a_[m]
-                    v_p2 = v_p1 / (self.d_g_[m].unsqueeze(1) * self.d_a_[m].unsqueeze(0))
-                    v_p = self.Q_g_[m] @ v_p2 @ self.Q_a_[m].t()
-                    v_p = v_p/torch.norm(v_p)
-                else:
-                    # Need to multiply with the unshifted matrix at end.
-                    p_p1 = opt.Q_g[m].t() @ v_p @ opt.Q_a[m]
-                    p_p2 = p_p1 / (opt.d_g[m].unsqueeze(1)
-                                   * opt.d_a[m].unsqueeze(0))
-                    p_p = opt.Q_g[m] @ p_p2 @ opt.Q_a[m].t()
-            prod_ps.append(p_p.flatten())
-            v_ps.append(v_p.flatten())
-        prod_p_full = torch.cat(prod_ps, axis=0)
-        v_p_full = torch.cat(v_ps, axis=0)
-        lambda_p = (v_p_full.T @ prod_p_full) / (v_p_full.T @ v_p_full)
-
-        print("Lambdas: {}, {}".format(lambda_1, lambda_p))
-        # Condition number
-        cond = torch.abs(lambda_1) / torch.abs(lambda_p)
-        yaarrr = cond*self.alpha
-        yaarrr.backward()
-
-        # Add updates
+                self._update_inv(m)
         for m in self.modules:
             classname = m.__class__.__name__
-            if self.steps % self.TInv == 0:
-                self._update_inv(m)
-            p_grad_mat = self._get_matrix_form_grad(m, classname)
-            v = self._get_natural_grad(m, p_grad_mat, damping)
-            updates[m] += v
+            p_grad_mat_1 = self._get_matrix_form_grad(m, classname)
+            p_grad_mat_2 = self.yaarrr_grads.get(m,
+                torch.zeros_like(p_grad_mat_1))
+            v = self._get_natural_grad(m, p_grad_mat_1 + p_grad_mat_2, damping)
+            updates[m] = v
         self._kl_clip_and_update_grad(updates, lr)
+        if self.steps % self.TInv == 0:
+            self._update_yaarrr_grads()
 
         self._step(closure)
         self.steps += 1
