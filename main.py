@@ -60,6 +60,8 @@ nc = {
     'cifar100': 100
 }
 num_classes = nc[args.dataset]
+
+"""
 net = get_network(args.network,
                   depth=args.depth,
                   num_classes=num_classes,
@@ -68,6 +70,36 @@ net = get_network(args.network,
                   widen_factor=args.widen_factor,
                   dropRate=args.dropRate)
 net = net.to(args.device)
+"""
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        #feed forward layers
+        self.linear1 = nn.Linear(32 * 32 * 3, 500)
+        self.linear2 = nn.Linear(500, 250)
+        self.linear3 = nn.Linear(250, 10)
+
+        #activations
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()  # Use sigmoid to convert the output into range (0,1)
+        self.softmax = nn.Softmax()
+
+    def forward(self, x):
+        #print(x.shape)
+        x = x.view(-1, 32 * 32 * 3)
+        out = self.linear1(x)
+        out = self.relu(out)
+        out = self.linear2(out)
+        out = self.relu(out)
+        out = self.linear3(out)
+        #print(out.shape)
+        return out
+
+
+torch.manual_seed(0)
+
+net = Net()
+net.cuda()
 
 # init dataloader
 trainloader, testloader = get_dataloader(dataset=args.dataset,
@@ -165,6 +197,10 @@ def train(epoch):
             loss_sample.backward(retain_graph=True)
             optimizer.acc_stats = False
             optimizer.zero_grad()  # clear the gradient for computing true-fisher.
+            print("m_aa")
+            print(optimizer.m_aa[optimizer.modules[1]])
+            print("m_gg")
+            print(optimizer.m_gg[optimizer.modules[1]])
         loss.backward()
         optimizer.step()
 
